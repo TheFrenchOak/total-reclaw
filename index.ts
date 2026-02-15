@@ -95,7 +95,7 @@ class FactsDB {
         value,
         content=facts,
         content_rowid=rowid,
-        tokenize='porter unicode61'
+        tokenize='unicode61 remove_diacritics 2'
       )
     `);
 
@@ -126,8 +126,11 @@ class FactsDB {
       CREATE INDEX IF NOT EXISTS idx_facts_created ON facts(created_at);
     `);
 
-    // ---- TTL/Decay migration ----
+    // ---- Migrations ----
     this.migrateDecayColumns();
+    this.migrateTimestampsToSeconds();
+    this.migrateFtsTokenizer();
+    this.migrateUpsertIndex();
   }
 
   private migrateDecayColumns(): void {
@@ -156,6 +159,91 @@ class FactsDB {
     `);
   }
 
+  private migrateTimestampsToSeconds(): void {
+    // Convert any millisecond timestamps to seconds
+    // Millisecond timestamps are > 1e12 (~year 2001+), second timestamps are < 1e11
+    const sample = this.db
+      .prepare(`SELECT created_at FROM facts WHERE created_at > 1000000000000 LIMIT 1`)
+      .get() as { created_at: number } | undefined;
+    if (!sample) return;
+
+    this.db.exec(`
+      UPDATE facts SET
+        created_at = created_at / 1000,
+        last_confirmed_at = CASE
+          WHEN last_confirmed_at > 1000000000000 THEN last_confirmed_at / 1000
+          ELSE last_confirmed_at
+        END
+      WHERE created_at > 1000000000000
+    `);
+  }
+
+  private migrateFtsTokenizer(): void {
+    this.db.exec(
+      `CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)`,
+    );
+    const row = this.db
+      .prepare(`SELECT value FROM _meta WHERE key = 'fts_version'`)
+      .get() as { value: string } | undefined;
+    if (row?.value === '2') return;
+
+    // Drop old FTS table and triggers, then recreate with new tokenizer
+    this.db.exec(`
+      DROP TRIGGER IF EXISTS facts_ai;
+      DROP TRIGGER IF EXISTS facts_ad;
+      DROP TRIGGER IF EXISTS facts_au;
+      DROP TABLE IF EXISTS facts_fts;
+
+      CREATE VIRTUAL TABLE facts_fts USING fts5(
+        text, category, entity, key, value,
+        content=facts,
+        content_rowid=rowid,
+        tokenize='unicode61 remove_diacritics 2'
+      );
+
+      CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN
+        INSERT INTO facts_fts(rowid, text, category, entity, key, value)
+        VALUES (new.rowid, new.text, new.category, new.entity, new.key, new.value);
+      END;
+
+      CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN
+        INSERT INTO facts_fts(facts_fts, rowid, text, category, entity, key, value)
+        VALUES ('delete', old.rowid, old.text, old.category, old.entity, old.key, old.value);
+      END;
+
+      CREATE TRIGGER facts_au AFTER UPDATE ON facts BEGIN
+        INSERT INTO facts_fts(facts_fts, rowid, text, category, entity, key, value)
+        VALUES ('delete', old.rowid, old.text, old.category, old.entity, old.key, old.value);
+        INSERT INTO facts_fts(rowid, text, category, entity, key, value)
+        VALUES (new.rowid, new.text, new.category, new.entity, new.key, new.value);
+      END;
+
+      INSERT INTO facts_fts(facts_fts) VALUES('rebuild');
+
+      INSERT OR REPLACE INTO _meta (key, value) VALUES ('fts_version', '2');
+    `);
+  }
+
+  private migrateUpsertIndex(): void {
+    const indexes = this.db
+      .prepare(`PRAGMA index_list(facts)`)
+      .all() as Array<{ name: string }>;
+    if (indexes.some(i => i.name === 'idx_facts_entity_key_unique')) return;
+
+    // Deduplicate existing (entity, key) pairs — keep most recent
+    this.db.exec(`
+      DELETE FROM facts WHERE rowid NOT IN (
+        SELECT MAX(rowid) FROM facts
+        WHERE entity IS NOT NULL AND key IS NOT NULL
+        GROUP BY entity, key
+      ) AND entity IS NOT NULL AND key IS NOT NULL
+    `);
+
+    this.db.exec(`
+      CREATE UNIQUE INDEX idx_facts_entity_key_unique ON facts(entity, key);
+    `);
+  }
+
   store(
     entry: Omit<
       MemoryEntry,
@@ -171,9 +259,7 @@ class FactsDB {
       confidence?: number;
     },
   ): MemoryEntry {
-    const id = randomUUID();
-    const now = Date.now();
-    const nowSec = Math.floor(now / 1000);
+    const nowSec = Math.floor(Date.now() / 1000);
 
     const decayClass =
       entry.decayClass ||
@@ -183,6 +269,47 @@ class FactsDB {
         ? entry.expiresAt
         : calculateExpiry(decayClass, nowSec);
     const confidence = entry.confidence ?? 1.0;
+
+    // UPSERT: if entity+key both set, update existing row
+    if (entry.entity && entry.key) {
+      const existing = this.db
+        .prepare(`SELECT id FROM facts WHERE entity = ? AND key = ?`)
+        .get(entry.entity, entry.key) as { id: string } | undefined;
+
+      if (existing) {
+        this.db
+          .prepare(
+            `UPDATE facts SET text=?, value=?, importance=?, category=?, source=?,
+              created_at=?, decay_class=?, expires_at=?, last_confirmed_at=?, confidence=?
+             WHERE id=?`,
+          )
+          .run(
+            entry.text,
+            entry.value,
+            entry.importance,
+            entry.category,
+            entry.source,
+            nowSec,
+            decayClass,
+            expiresAt,
+            nowSec,
+            confidence,
+            existing.id,
+          );
+
+        return {
+          ...entry,
+          id: existing.id,
+          createdAt: nowSec,
+          decayClass,
+          expiresAt,
+          lastConfirmedAt: nowSec,
+          confidence,
+        };
+      }
+    }
+
+    const id = randomUUID();
 
     this.db
       .prepare(
@@ -198,7 +325,7 @@ class FactsDB {
         entry.key,
         entry.value,
         entry.source,
-        now,
+        nowSec,
         decayClass,
         expiresAt,
         nowSec,
@@ -208,7 +335,7 @@ class FactsDB {
     return {
       ...entry,
       id,
-      createdAt: now,
+      createdAt: nowSec,
       decayClass,
       expiresAt,
       lastConfirmedAt: nowSec,
@@ -586,14 +713,16 @@ class VectorDB {
   }
 
   async store(entry: {
+    id?: string;
     text: string;
     vector: number[];
     importance: number;
     category: string;
   }): Promise<string> {
     await this.ensureInitialized();
-    const id = randomUUID();
-    await this.table!.add([{ ...entry, id, createdAt: Date.now() }]);
+    const id = entry.id || randomUUID();
+    const nowSec = Math.floor(Date.now() / 1000);
+    await this.table!.add([{ ...entry, id, createdAt: nowSec }]);
     return id;
   }
 
@@ -623,6 +752,10 @@ class VectorDB {
             value: null,
             source: 'conversation',
             createdAt: row.createdAt as number,
+            decayClass: 'stable' as DecayClass,
+            expiresAt: null,
+            lastConfirmedAt: row.createdAt as number,
+            confidence: 1.0,
           },
           score,
           backend: 'lancedb' as const,
@@ -831,6 +964,54 @@ function extractStructuredFields(
     };
   }
 
+  // FR: decisions
+  const frDecisionMatch = text.match(
+    /(?:on a décidé|on a choisi|on utilise|on prend)\s+(.+?)(?:\s+(?:parce que|car|pour)\s+(.+?))?\.?$/i,
+  );
+  if (frDecisionMatch) {
+    return {
+      entity: 'decision',
+      key: frDecisionMatch[1].trim().slice(0, 100),
+      value: frDecisionMatch[2]?.trim() || 'pas de justification',
+    };
+  }
+
+  // FR: conventions
+  const frRuleMatch = text.match(
+    /(?:toujours|jamais)\s+(?:utiliser|faire|mettre)\s+(.+?)\.?$/i,
+  );
+  if (frRuleMatch) {
+    return {
+      entity: 'convention',
+      key: frRuleMatch[1].trim().slice(0, 100),
+      value: lower.includes('jamais') ? 'never' : 'always',
+    };
+  }
+
+  // FR: possessive
+  const frPossessiveMatch = text.match(
+    /(?:mon|ma|mes|son|sa|ses)\s+(.+?)\s+(?:est|c'est|sont)\s+(.+?)\.?$/i,
+  );
+  if (frPossessiveMatch) {
+    return {
+      entity: 'user',
+      key: frPossessiveMatch[1].trim(),
+      value: frPossessiveMatch[2].trim(),
+    };
+  }
+
+  // FR: preferences
+  const frPreferMatch = text.match(
+    /je\s+(?:préfère|préfere|aime|déteste|veux|utilise)\s+(.+?)\.?$/i,
+  );
+  if (frPreferMatch) {
+    return {
+      entity: 'user',
+      key: 'prefer',
+      value: frPreferMatch[1].trim(),
+    };
+  }
+
   const emailMatch = text.match(/([\w.-]+@[\w.-]+\.\w+)/);
   if (emailMatch) {
     return { entity: null, key: 'email', value: emailMatch[1] };
@@ -871,6 +1052,13 @@ const MEMORY_TRIGGERS = [
   /over.*because|instead of.*since/i,
   /\balways\b.*\buse\b|\bnever\b.*\buse\b/i,
   /architecture|stack|approach/i,
+  // FR
+  /retiens|souviens-toi|n'oublie pas|rappelle-toi/i,
+  /je préfère|j'aime|je déteste|je veux|je ne veux pas/i,
+  /on a décidé|on utilise|on choisit|on a choisi/i,
+  /mon\s+\w+\s+(?:est|c'est)|ma\s+\w+\s+(?:est|c'est)/i,
+  /toujours\s+utiliser|jamais\s+utiliser/i,
+  /habite à|travaille chez|né le|née le/i,
 ];
 
 const SENSITIVE_PATTERNS = [
@@ -896,15 +1084,16 @@ function shouldCapture(text: string): boolean {
 function detectCategory(text: string): MemoryCategory {
   const lower = text.toLowerCase();
   if (
-    /decided|chose|went with|selected|always use|never use|over.*because|instead of.*since|rozhodli|will use|budeme/i.test(
+    /decided|chose|went with|selected|always use|never use|over.*because|instead of.*since|rozhodli|will use|budeme|on a décidé|on a choisi|on utilise|toujours utiliser|jamais utiliser/i.test(
       lower,
     )
   )
     return 'decision';
-  if (/prefer|radši|like|love|hate|want/i.test(lower)) return 'preference';
-  if (/\+\d{10,}|@[\w.-]+\.\w+|is called|jmenuje se/i.test(lower))
+  if (/prefer|radši|like|love|hate|want|je préfère|j'aime|je déteste|je veux/i.test(lower))
+    return 'preference';
+  if (/\+\d{10,}|@[\w.-]+\.\w+|is called|jmenuje se|s'appelle/i.test(lower))
     return 'entity';
-  if (/born|birthday|lives|works|is\s|are\s|has\s|have\s/i.test(lower))
+  if (/born|birthday|lives|works|is\s|are\s|has\s|have\s|habite à|travaille chez|née? le/i.test(lower))
     return 'fact';
   return 'other';
 }
@@ -1107,6 +1296,7 @@ const memoryHybridPlugin = {
             const vector = await embeddings.embed(text);
             if (!(await vectorDb.hasDuplicate(vector))) {
               await vectorDb.store({
+                id: entry.id,
                 text,
                 vector,
                 importance,
@@ -1671,7 +1861,7 @@ const memoryHybridPlugin = {
             if (!msg || typeof msg !== 'object') continue;
             const msgObj = msg as Record<string, unknown>;
             const role = msgObj.role;
-            if (role !== 'user' && role !== 'assistant') continue;
+            if (role !== 'user') continue;
 
             const content = msgObj.content;
             if (typeof content === 'string') {
@@ -1702,9 +1892,12 @@ const memoryHybridPlugin = {
             const category = detectCategory(text);
             const extracted = extractStructuredFields(text, category);
 
+            // Only auto-capture structured facts (entity or key extracted)
+            if (!extracted.entity && !extracted.key) continue;
+
             if (factsDb.hasDuplicate(text)) continue;
 
-            factsDb.store({
+            const storedEntry = factsDb.store({
               text,
               category,
               importance: 0.7,
@@ -1718,6 +1911,7 @@ const memoryHybridPlugin = {
               const vector = await embeddings.embed(text);
               if (!(await vectorDb.hasDuplicate(vector))) {
                 await vectorDb.store({
+                  id: storedEntry.id,
                   text,
                   vector,
                   importance: 0.7,
