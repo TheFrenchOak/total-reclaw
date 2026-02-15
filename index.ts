@@ -132,6 +132,8 @@ class FactsDB {
     this.migrateTimestampsToSeconds();
     this.migrateFtsTokenizer();
     this.migrateUpsertIndex();
+    this.migrateNullExpiry();
+    this.migrateNocaseIndex();
   }
 
   private migrateDecayColumns(): void {
@@ -231,17 +233,18 @@ class FactsDB {
       .all() as Array<{ name: string }>;
     if (indexes.some(i => i.name === 'idx_facts_entity_key_unique')) return;
 
-    // Deduplicate existing (entity, key) pairs — keep most recent
+    // Deduplicate existing (entity, key) pairs (case-insensitive) — keep most recent
     this.db.exec(`
       DELETE FROM facts WHERE rowid NOT IN (
         SELECT MAX(rowid) FROM facts
         WHERE entity IS NOT NULL AND key IS NOT NULL
-        GROUP BY entity, key
+        GROUP BY entity COLLATE NOCASE, key COLLATE NOCASE
       ) AND entity IS NOT NULL AND key IS NOT NULL
     `);
 
     this.db.exec(`
-      CREATE UNIQUE INDEX idx_facts_entity_key_unique ON facts(entity, key);
+      CREATE UNIQUE INDEX idx_facts_entity_key_unique
+        ON facts(entity COLLATE NOCASE, key COLLATE NOCASE);
     `);
   }
 
@@ -274,7 +277,7 @@ class FactsDB {
     // UPSERT: if entity+key both set, update existing row
     if (entry.entity && entry.key) {
       const existing = this.db
-        .prepare(`SELECT id FROM facts WHERE entity = ? AND key = ?`)
+        .prepare(`SELECT id FROM facts WHERE entity = ? COLLATE NOCASE AND key = ? COLLATE NOCASE`)
         .get(entry.entity, entry.key) as { id: string } | undefined;
 
       if (existing) {
@@ -358,6 +361,7 @@ class FactsDB {
           END
       WHERE id = @id
         AND decay_class IN ('stable', 'active')
+        AND (expires_at IS NULL OR expires_at > @now)
     `);
 
     const tx = this.db.transaction(() => {
@@ -383,7 +387,7 @@ class FactsDB {
     const safeQuery = query
       .replace(/['"]/g, '')
       .split(/\s+/)
-      .filter(w => w.length > 1)
+      .filter(w => w.length > 1 && !STOP_WORDS.has(w.toLowerCase()))
       .map(w => `"${w}"`)
       .join(' OR ');
 
@@ -423,7 +427,8 @@ class FactsDB {
     const range = maxRank - minRank || 1;
 
     const results = rows.map(row => {
-      const bm25Score = 1 - ((row.rank as number) - minRank) / range || 0.8;
+      const rawBm25 = 1 - ((row.rank as number) - minRank) / range;
+      const bm25Score = Number.isFinite(rawBm25) ? rawBm25 : 0.8;
       const freshness = (row.freshness as number) || 1.0;
       const confidence = (row.confidence as number) || 1.0;
       const composite = bm25Score * 0.6 + freshness * 0.25 + confidence * 0.15;
@@ -460,8 +465,8 @@ class FactsDB {
   lookup(entity: string, key?: string): SearchResult[] {
     const nowSec = Math.floor(Date.now() / 1000);
     const base = key
-      ? `SELECT * FROM facts WHERE lower(entity) = lower(?) AND lower(key) = lower(?) AND (expires_at IS NULL OR expires_at > ?) ORDER BY confidence DESC, created_at DESC`
-      : `SELECT * FROM facts WHERE lower(entity) = lower(?) AND (expires_at IS NULL OR expires_at > ?) ORDER BY confidence DESC, created_at DESC`;
+      ? `SELECT * FROM facts WHERE entity = ? COLLATE NOCASE AND key = ? COLLATE NOCASE AND (expires_at IS NULL OR expires_at > ?) ORDER BY confidence DESC, created_at DESC`
+      : `SELECT * FROM facts WHERE entity = ? COLLATE NOCASE AND (expires_at IS NULL OR expires_at > ?) ORDER BY confidence DESC, created_at DESC`;
 
     const params = key ? [entity, key, nowSec] : [entity, nowSec];
     const rows = this.db.prepare(base).all(...params) as Array<
@@ -512,34 +517,44 @@ class FactsDB {
     return row.cnt;
   }
 
-  pruneExpired(): number {
+  pruneExpired(): { count: number; ids: string[] } {
     const nowSec = Math.floor(Date.now() / 1000);
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM facts WHERE expires_at IS NOT NULL AND expires_at < ?`,
+      )
+      .all(nowSec) as Array<{ id: string }>;
+    if (rows.length === 0) return { count: 0, ids: [] };
+    const ids = rows.map(r => r.id);
     const result = this.db
       .prepare(
         `DELETE FROM facts WHERE expires_at IS NOT NULL AND expires_at < ?`,
       )
       .run(nowSec);
-    return result.changes;
+    return { count: result.changes, ids };
   }
 
   decayConfidence(): number {
     const nowSec = Math.floor(Date.now() / 1000);
 
-    this.db
+    // Time-based confidence: linearly decays from 1.0 to 0.0 over the
+    // period between last_confirmed_at and expires_at.
+    // Accessing a memory (refreshAccessedFacts) resets last_confirmed_at
+    // and extends expires_at, which restores confidence — like human recall
+    // strengthening a memory.
+    // No deletion here — only pruneExpired removes facts at their hard TTL.
+    const result = this.db
       .prepare(
         `UPDATE facts
-         SET confidence = confidence * 0.5
+         SET confidence = MAX(0.05, 1.0 - CAST(@now - last_confirmed_at AS REAL)
+                           / CAST(expires_at - last_confirmed_at AS REAL))
          WHERE expires_at IS NOT NULL
            AND expires_at > @now
            AND last_confirmed_at IS NOT NULL
-           AND (@now - last_confirmed_at) > (expires_at - last_confirmed_at) * 0.75
-           AND confidence > 0.1`,
+           AND (expires_at - last_confirmed_at) > 0`,
       )
       .run({ now: nowSec });
 
-    const result = this.db
-      .prepare(`DELETE FROM facts WHERE confidence < 0.1`)
-      .run();
     return result.changes;
   }
 
@@ -575,7 +590,7 @@ class FactsDB {
       category: 'other' as MemoryCategory,
       importance: 0.9,
       entity: 'system',
-      key: `checkpoint:${Date.now()}`,
+      key: `checkpoint:${Math.floor(Date.now() / 1000)}`,
       value: context.intent.slice(0, 100),
       source: 'checkpoint',
       decayClass: 'checkpoint',
@@ -635,7 +650,9 @@ class FactsDB {
   backfillDecayClasses(): Record<string, number> {
     const rows = this.db
       .prepare(
-        `SELECT rowid, entity, key, value, text FROM facts WHERE decay_class = 'stable'`,
+        `SELECT rowid, entity, key, value, text, decay_class, expires_at FROM facts
+         WHERE decay_class = 'stable'
+            OR (expires_at IS NULL AND decay_class != 'permanent')`,
       )
       .all() as Array<{
       rowid: number;
@@ -643,6 +660,8 @@ class FactsDB {
       key: string;
       value: string;
       text: string;
+      decay_class: string;
+      expires_at: number | null;
     }>;
 
     const nowSec = Math.floor(Date.now() / 1000);
@@ -654,14 +673,54 @@ class FactsDB {
     const tx = this.db.transaction(() => {
       for (const row of rows) {
         const dc = classifyDecay(row.entity, row.key, row.value, row.text);
-        if (dc === 'stable') continue;
         const exp = calculateExpiry(dc, nowSec);
+        if (dc === row.decay_class && row.expires_at !== null) continue;
         update.run(dc, exp, row.rowid);
         counts[dc] = (counts[dc] || 0) + 1;
       }
     });
     tx();
     return counts;
+  }
+
+  private migrateNullExpiry(): void {
+    const nowSec = Math.floor(Date.now() / 1000);
+    for (const [dc, ttl] of Object.entries(TTL_DEFAULTS)) {
+      if (ttl === null) continue;
+      this.db
+        .prepare(
+          `UPDATE facts SET expires_at = ? WHERE decay_class = ? AND expires_at IS NULL`,
+        )
+        .run(nowSec + ttl, dc);
+    }
+  }
+
+  private migrateNocaseIndex(): void {
+    this.db.exec(
+      `CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)`,
+    );
+    const row = this.db
+      .prepare(`SELECT value FROM _meta WHERE key = 'nocase_index'`)
+      .get() as { value: string } | undefined;
+    if (row?.value === '1') return;
+
+    // Deduplicate case-insensitive before recreating the index
+    this.db.exec(`
+      DELETE FROM facts WHERE rowid NOT IN (
+        SELECT MAX(rowid) FROM facts
+        WHERE entity IS NOT NULL AND key IS NOT NULL
+        GROUP BY entity COLLATE NOCASE, key COLLATE NOCASE
+      ) AND entity IS NOT NULL AND key IS NOT NULL
+    `);
+
+    this.db.exec(`
+      DROP INDEX IF EXISTS idx_facts_entity_key_unique;
+      CREATE UNIQUE INDEX idx_facts_entity_key_unique
+        ON facts(entity COLLATE NOCASE, key COLLATE NOCASE);
+      DROP INDEX IF EXISTS idx_facts_entity;
+      CREATE INDEX idx_facts_entity ON facts(entity COLLATE NOCASE);
+      INSERT OR REPLACE INTO _meta (key, value) VALUES ('nocase_index', '1');
+    `);
   }
 
   close(): void {
@@ -722,6 +781,12 @@ class VectorDB {
   }): Promise<string> {
     await this.ensureInitialized();
     const id = entry.id || randomUUID();
+    // Delete existing entry with same ID to support upserts
+    if (entry.id) {
+      try {
+        await this.table!.delete(`id = '${id}'`);
+      } catch {}
+    }
     const nowSec = Math.floor(Date.now() / 1000);
     await this.table!.add([{ ...entry, id, createdAt: nowSec }]);
     return id;
@@ -782,6 +847,22 @@ class VectorDB {
     return true;
   }
 
+  async deleteMany(ids: string[]): Promise<number> {
+    if (ids.length === 0) return 0;
+    await this.ensureInitialized();
+    const uuidRegex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    let deleted = 0;
+    for (const id of ids) {
+      if (!uuidRegex.test(id)) continue;
+      try {
+        await this.table!.delete(`id = '${id}'`);
+        deleted++;
+      } catch {}
+    }
+    return deleted;
+  }
+
   async count(): Promise<number> {
     await this.ensureInitialized();
     return this.table!.countRows();
@@ -809,6 +890,31 @@ class Embeddings {
     return resp.data[0].embedding;
   }
 }
+
+// ============================================================================
+// Stop Words
+// ============================================================================
+
+const STOP_WORDS = new Set([
+  // EN
+  'the', 'be', 'to', 'of', 'and', 'in', 'that', 'have', 'it', 'for', 'not',
+  'on', 'with', 'he', 'as', 'you', 'do', 'at', 'this', 'but', 'his', 'by',
+  'from', 'they', 'we', 'say', 'her', 'she', 'or', 'an', 'will', 'my', 'one',
+  'all', 'would', 'there', 'their', 'what', 'so', 'up', 'out', 'if', 'about',
+  'who', 'get', 'which', 'go', 'me', 'when', 'make', 'can', 'no', 'just',
+  'him', 'know', 'take', 'how', 'could', 'them', 'see', 'than', 'now', 'come',
+  'its', 'over', 'also', 'after', 'did', 'should', 'any', 'where', 'then',
+  'here', 'been', 'has', 'had', 'was', 'were', 'are', 'is', 'am', 'does',
+  'yes', 'yeah', 'no', 'ok', 'okay', 'sure', 'please', 'thanks', 'thank',
+  'hello', 'hi', 'hey',
+  // FR
+  'le', 'la', 'les', 'de', 'du', 'des', 'un', 'une', 'et', 'en', 'que',
+  'qui', 'dans', 'ce', 'il', 'ne', 'se', 'pas', 'plus', 'par', 'sur', 'est',
+  'sont', 'au', 'aux', 'ou', 'mais', 'son', 'sa', 'ses', 'avec', 'pour',
+  'nous', 'vous', 'ils', 'elles', 'je', 'tu', 'on', 'elle', 'lui', 'leur',
+  'été', 'être', 'avoir', 'fait', 'comme', 'tout', 'bien', 'oui', 'non',
+  'merci', 'bonjour', 'salut',
+]);
 
 // ============================================================================
 // Merge & Deduplicate
@@ -1075,7 +1181,7 @@ function shouldCapture(text: string): boolean {
   if (text.length < 10 || text.length > 500) return false;
   if (text.includes('<relevant-memories>')) return false;
   if (text.startsWith('<') && text.includes('</')) return false;
-  if (text.includes('**') && text.includes('\n-')) return false;
+  if (/^\*\*[^*]+\*\*\n-/.test(text)) return false;
   const emojiCount = (text.match(/[\u{1F300}-\u{1F9FF}]/gu) || []).length;
   if (emojiCount > 3) return false;
   if (SENSITIVE_PATTERNS.some(r => r.test(text))) return false;
@@ -1158,7 +1264,7 @@ function scanMemoryFiles(factsDb: FactsDB, daysBack = 3): number {
   for (let d = 0; d < daysBack; d++) {
     const date = new Date();
     date.setDate(date.getDate() - d);
-    const dateStr = date.toISOString().split('T')[0];
+    const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
     total += extractFromMarkdownFile(
       join(memoryDir, `${dateStr}.md`),
       `daily-scan:${dateStr}`,
@@ -1312,7 +1418,7 @@ const memoryHybridPlugin = {
             }),
           ),
           decayClass: Type.Optional(
-            stringEnum(DECAY_CLASSES as unknown as readonly string[]),
+            stringEnum([...DECAY_CLASSES]),
           ),
         }),
         async execute(_toolCallId, params) {
@@ -1449,23 +1555,6 @@ const memoryHybridPlugin = {
                   { type: 'text', text: 'No matching memories found.' },
                 ],
                 details: { found: 0 },
-              };
-            }
-
-            if (results.length === 1 && results[0].score > 0.9) {
-              const id = results[0].entry.id;
-              factsDb.delete(id);
-              try {
-                await vectorDb.delete(id);
-              } catch {}
-              return {
-                content: [
-                  {
-                    type: 'text',
-                    text: `Forgotten: "${results[0].entry.text}"`,
-                  },
-                ],
-                details: { action: 'deleted', id },
               };
             }
 
@@ -1608,13 +1697,24 @@ const memoryHybridPlugin = {
           };
 
           let hardPruned = 0;
-          let softPruned = 0;
+          let softDecayed = 0;
+          const deletedIds: string[] = [];
 
           if (mode === 'hard' || mode === 'both') {
-            hardPruned = factsDb.pruneExpired();
+            const result = factsDb.pruneExpired();
+            hardPruned = result.count;
+            deletedIds.push(...result.ids);
           }
           if (mode === 'soft' || mode === 'both') {
-            softPruned = factsDb.decayConfidence();
+            softDecayed = factsDb.decayConfidence();
+          }
+
+          if (deletedIds.length > 0) {
+            try {
+              await vectorDb.deleteMany(deletedIds);
+            } catch (err) {
+              api.logger.warn(`total-reclaw: vector prune failed: ${err}`);
+            }
           }
 
           const breakdown = factsDb.statsBreakdown();
@@ -1624,12 +1724,12 @@ const memoryHybridPlugin = {
             content: [
               {
                 type: 'text',
-                text: `Pruned: ${hardPruned} expired + ${softPruned} low-confidence.\nRemaining by class: ${JSON.stringify(breakdown)}\nPending expired: ${expired}`,
+                text: `Pruned: ${hardPruned} expired. Decayed: ${softDecayed} confidence-updated.\nRemaining by class: ${JSON.stringify(breakdown)}\nPending expired: ${expired}`,
               },
             ],
             details: {
               hardPruned,
-              softPruned,
+              softDecayed,
               breakdown,
               pendingExpired: expired,
             },
@@ -1683,17 +1783,26 @@ const memoryHybridPlugin = {
               return;
             }
             let hardPruned = 0;
-            let softPruned = 0;
+            let softDecayed = 0;
+            const deletedIds: string[] = [];
             if (opts.hard) {
-              hardPruned = factsDb.pruneExpired();
+              const result = factsDb.pruneExpired();
+              hardPruned = result.count;
+              deletedIds.push(...result.ids);
             } else if (opts.soft) {
-              softPruned = factsDb.decayConfidence();
+              softDecayed = factsDb.decayConfidence();
             } else {
-              hardPruned = factsDb.pruneExpired();
-              softPruned = factsDb.decayConfidence();
+              const hardResult = factsDb.pruneExpired();
+              hardPruned = hardResult.count;
+              deletedIds.push(...hardResult.ids);
+              softDecayed = factsDb.decayConfidence();
+            }
+            if (deletedIds.length > 0) {
+              const vectorDeleted = await vectorDb.deleteMany(deletedIds);
+              console.log(`Vector cleanup: ${vectorDeleted} removed from LanceDB`);
             }
             console.log(`Hard-pruned: ${hardPruned} expired`);
-            console.log(`Soft-pruned: ${softPruned} low-confidence`);
+            console.log(`Soft-decayed: ${softDecayed} confidence updated`);
           });
 
         mem
@@ -1747,7 +1856,8 @@ const memoryHybridPlugin = {
           .description('Extract structured facts from daily memory files')
           .option('--days <n>', 'How many days back to scan', '7')
           .action(async (opts: { days: string }) => {
-            const daysBack = parseInt(opts.days);
+            const parsed = parseInt(opts.days);
+            const daysBack = Number.isFinite(parsed) && parsed > 0 ? parsed : 7;
             const stored = scanMemoryFiles(factsDb, daysBack);
             console.log(`Extracted ${stored} new facts from last ${daysBack} days + MEMORY.md`);
           });
@@ -1758,10 +1868,18 @@ const memoryHybridPlugin = {
           .argument('<query>', 'Search query')
           .option('--limit <n>', 'Max results', '5')
           .action(async (query, opts) => {
-            const limit = parseInt(opts.limit);
+            const parsed = parseInt(opts.limit);
+            const limit = Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
             const sqlResults = factsDb.search(query, limit);
-            const vector = await embeddings.embed(query);
-            const lanceResults = await vectorDb.search(vector, limit, 0.3);
+
+            let lanceResults: SearchResult[] = [];
+            try {
+              const vector = await embeddings.embed(query);
+              lanceResults = await vectorDb.search(vector, limit, 0.3);
+            } catch (err) {
+              console.error(`Vector search failed (FTS-only results): ${err}`);
+            }
+
             const merged = mergeResults(sqlResults, lanceResults, limit);
 
             const output = merged.map(r => ({
@@ -1944,10 +2062,15 @@ const memoryHybridPlugin = {
         );
 
         if (expired > 0) {
-          const pruned = factsDb.pruneExpired();
+          const { count: pruned, ids } = factsDb.pruneExpired();
           api.logger.info(
             `total-reclaw: startup prune removed ${pruned} expired facts`,
           );
+          if (ids.length > 0) {
+            vectorDb.deleteMany(ids).catch(err =>
+              api.logger.warn(`total-reclaw: startup vector prune failed: ${err}`),
+            );
+          }
         }
 
         // Auto-index Markdown files (MEMORY.md + last 3 days of dailies)
@@ -1962,13 +2085,19 @@ const memoryHybridPlugin = {
           api.logger.warn(`total-reclaw: startup scan failed: ${err}`);
         }
 
+        if (pruneTimer) clearInterval(pruneTimer);
         pruneTimer = setInterval(() => {
           try {
-            const hardPruned = factsDb.pruneExpired();
-            const softPruned = factsDb.decayConfidence();
-            if (hardPruned > 0 || softPruned > 0) {
+            const { count: hardPruned, ids: hardIds } = factsDb.pruneExpired();
+            const softDecayed = factsDb.decayConfidence();
+            if (hardIds.length > 0) {
+              vectorDb.deleteMany(hardIds).catch(err =>
+                api.logger.warn(`total-reclaw: periodic vector prune failed: ${err}`),
+              );
+            }
+            if (hardPruned > 0 || softDecayed > 0) {
               api.logger.info(
-                `total-reclaw: periodic prune — ${hardPruned} expired, ${softPruned} decayed`,
+                `total-reclaw: periodic prune — ${hardPruned} expired, ${softDecayed} confidence-updated`,
               );
             }
           } catch (err) {
