@@ -14,8 +14,9 @@ import * as lancedb from '@lancedb/lancedb';
 import Database from 'better-sqlite3';
 import OpenAI from 'openai';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 import type { ClawdbotPluginApi } from 'openclaw/plugin-sdk';
 import { stringEnum } from 'openclaw/plugin-sdk';
 
@@ -1099,12 +1100,81 @@ function detectCategory(text: string): MemoryCategory {
 }
 
 // ============================================================================
+// Markdown File Extraction
+// ============================================================================
+
+function extractFromMarkdownFile(
+  filePath: string,
+  source: string,
+  factsDb: FactsDB,
+): number {
+  if (!existsSync(filePath)) return 0;
+
+  const content = readFileSync(filePath, 'utf-8');
+  const lines = content
+    .split('\n')
+    .filter(l => l.trim().length > 10);
+
+  let stored = 0;
+  for (const line of lines) {
+    const trimmed = line.replace(/^[-*#>\s]+/, '').trim();
+    if (trimmed.length < 15 || trimmed.length > 500) continue;
+    if (SENSITIVE_PATTERNS.some(r => r.test(trimmed))) continue;
+
+    const category = detectCategory(trimmed);
+    const extracted = extractStructuredFields(trimmed, category);
+
+    if (!extracted.entity && !extracted.key && category !== 'decision')
+      continue;
+
+    if (factsDb.hasDuplicate(trimmed)) continue;
+
+    factsDb.store({
+      text: trimmed,
+      category,
+      importance: 0.8,
+      entity: extracted.entity,
+      key: extracted.key,
+      value: extracted.value,
+      source,
+    });
+    stored++;
+  }
+  return stored;
+}
+
+function scanMemoryFiles(factsDb: FactsDB, daysBack = 3): number {
+  const memoryDir = join(homedir(), '.openclaw', 'memory');
+  let total = 0;
+
+  // Scan MEMORY.md
+  total += extractFromMarkdownFile(
+    join(homedir(), '.openclaw', 'workspace', 'MEMORY.md'),
+    'markdown:MEMORY.md',
+    factsDb,
+  );
+
+  // Scan daily files
+  for (let d = 0; d < daysBack; d++) {
+    const date = new Date();
+    date.setDate(date.getDate() - d);
+    const dateStr = date.toISOString().split('T')[0];
+    total += extractFromMarkdownFile(
+      join(memoryDir, `${dateStr}.md`),
+      `daily-scan:${dateStr}`,
+      factsDb,
+    );
+  }
+  return total;
+}
+
+// ============================================================================
 // Plugin Definition
 // ============================================================================
 
 const memoryHybridPlugin = {
-  id: 'memory-hybrid',
-  name: 'Memory (Hybrid: SQLite + LanceDB)',
+  id: 'total-reclaw',
+  name: 'Total Reclaw',
   description:
     'Two-tier memory: SQLite+FTS5 for structured facts, LanceDB for semantic search',
   kind: 'memory' as const,
@@ -1126,7 +1196,7 @@ const memoryHybridPlugin = {
     let pruneTimer: ReturnType<typeof setInterval> | null = null;
 
     api.logger.info(
-      `memory-hybrid: registered (sqlite: ${resolvedSqlitePath}, lance: ${resolvedLancePath})`,
+      `total-reclaw: registered (sqlite: ${resolvedSqlitePath}, lance: ${resolvedLancePath})`,
     );
 
     // ========================================================================
@@ -1170,7 +1240,7 @@ const memoryHybridPlugin = {
             const vector = await embeddings.embed(query);
             lanceResults = await vectorDb.search(vector, limit, 0.3);
           } catch (err) {
-            api.logger.warn(`memory-hybrid: vector search failed: ${err}`);
+            api.logger.warn(`total-reclaw: vector search failed: ${err}`);
           }
 
           const results = mergeResults(sqliteResults, lanceResults, limit);
@@ -1304,7 +1374,7 @@ const memoryHybridPlugin = {
               });
             }
           } catch (err) {
-            api.logger.warn(`memory-hybrid: vector store failed: ${err}`);
+            api.logger.warn(`total-reclaw: vector store failed: ${err}`);
           }
 
           return {
@@ -1676,84 +1746,10 @@ const memoryHybridPlugin = {
           .command('extract-daily')
           .description('Extract structured facts from daily memory files')
           .option('--days <n>', 'How many days back to scan', '7')
-          .option('--dry-run', 'Show extractions without storing')
-          .action(async (opts: { days: string; dryRun?: boolean }) => {
-            const fs = await import('node:fs');
-            const path = await import('node:path');
-            const { homedir: getHomedir } = await import('node:os');
-            const memoryDir = path.join(getHomedir(), '.openclaw', 'memory');
+          .action(async (opts: { days: string }) => {
             const daysBack = parseInt(opts.days);
-
-            let totalExtracted = 0;
-            let totalStored = 0;
-
-            for (let d = 0; d < daysBack; d++) {
-              const date = new Date();
-              date.setDate(date.getDate() - d);
-              const dateStr = date.toISOString().split('T')[0];
-              const filePath = path.join(memoryDir, `${dateStr}.md`);
-
-              if (!fs.existsSync(filePath)) continue;
-
-              const content = fs.readFileSync(filePath, 'utf-8');
-              const lines = content
-                .split('\n')
-                .filter((l: string) => l.trim().length > 10);
-
-              console.log(`\nScanning ${dateStr} (${lines.length} lines)...`);
-
-              for (const line of lines) {
-                const trimmed = line.replace(/^[-*#>\s]+/, '').trim();
-                if (trimmed.length < 15 || trimmed.length > 500) continue;
-                if (SENSITIVE_PATTERNS.some(r => r.test(trimmed))) continue;
-
-                const category = detectCategory(trimmed);
-                const extracted = extractStructuredFields(trimmed, category);
-
-                if (
-                  !extracted.entity &&
-                  !extracted.key &&
-                  category !== 'decision'
-                )
-                  continue;
-
-                totalExtracted++;
-
-                if (opts.dryRun) {
-                  console.log(
-                    `  [${category}] ${extracted.entity || '?'} / ${extracted.key || '?'} = ${
-                      extracted.value || trimmed.slice(0, 60)
-                    }`,
-                  );
-                  continue;
-                }
-
-                if (factsDb.hasDuplicate(trimmed)) continue;
-
-                factsDb.store({
-                  text: trimmed,
-                  category,
-                  importance: 0.8,
-                  entity: extracted.entity,
-                  key: extracted.key,
-                  value: extracted.value,
-                  source: `daily-scan:${dateStr}`,
-                });
-                totalStored++;
-              }
-            }
-
-            if (opts.dryRun) {
-              console.log(
-                `\nWould extract: ${totalExtracted} facts from last ${daysBack} days`,
-              );
-            } else {
-              console.log(
-                `\nExtracted ${totalStored} new facts (${totalExtracted} candidates, ${
-                  totalExtracted - totalStored
-                } duplicates skipped)`,
-              );
-            }
+            const stored = scanMemoryFiles(factsDb, daysBack);
+            console.log(`Extracted ${stored} new facts from last ${daysBack} days + MEMORY.md`);
           });
 
         mem
@@ -1826,7 +1822,7 @@ const memoryHybridPlugin = {
             const vector = await embeddings.embed(event.prompt);
             lanceResults = await vectorDb.search(vector, 3, 0.3);
           } catch (err) {
-            api.logger.warn(`memory-hybrid: vector recall failed: ${err}`);
+            api.logger.warn(`total-reclaw: vector recall failed: ${err}`);
           }
 
           const results = mergeResults(ftsResults, lanceResults, 5);
@@ -1837,14 +1833,14 @@ const memoryHybridPlugin = {
             .join('\n');
 
           api.logger.info?.(
-            `memory-hybrid: injecting ${results.length} memories (sqlite: ${ftsResults.length}, lance: ${lanceResults.length})`,
+            `total-reclaw: injecting ${results.length} memories (sqlite: ${ftsResults.length}, lance: ${lanceResults.length})`,
           );
 
           return {
             prependContext: `<relevant-memories>\nThe following memories may be relevant:\n${memoryContext}\n</relevant-memories>`,
           };
         } catch (err) {
-          api.logger.warn(`memory-hybrid: recall failed: ${String(err)}`);
+          api.logger.warn(`total-reclaw: recall failed: ${String(err)}`);
         }
       });
     }
@@ -1919,17 +1915,17 @@ const memoryHybridPlugin = {
                 });
               }
             } catch (err) {
-              api.logger.warn(`memory-hybrid: vector capture failed: ${err}`);
+              api.logger.warn(`total-reclaw: vector capture failed: ${err}`);
             }
 
             stored++;
           }
 
           if (stored > 0) {
-            api.logger.info(`memory-hybrid: auto-captured ${stored} memories`);
+            api.logger.info(`total-reclaw: auto-captured ${stored} memories`);
           }
         } catch (err) {
-          api.logger.warn(`memory-hybrid: capture failed: ${String(err)}`);
+          api.logger.warn(`total-reclaw: capture failed: ${String(err)}`);
         }
       });
     }
@@ -1939,19 +1935,31 @@ const memoryHybridPlugin = {
     // ========================================================================
 
     api.registerService({
-      id: 'memory-hybrid',
+      id: 'total-reclaw',
       start: () => {
         const sqlCount = factsDb.count();
         const expired = factsDb.countExpired();
         api.logger.info(
-          `memory-hybrid: initialized (sqlite: ${sqlCount} facts, lance: ${resolvedLancePath}, model: ${cfg.embedding.model})`,
+          `total-reclaw: initialized (sqlite: ${sqlCount} facts, lance: ${resolvedLancePath}, model: ${cfg.embedding.model})`,
         );
 
         if (expired > 0) {
           const pruned = factsDb.pruneExpired();
           api.logger.info(
-            `memory-hybrid: startup prune removed ${pruned} expired facts`,
+            `total-reclaw: startup prune removed ${pruned} expired facts`,
           );
+        }
+
+        // Auto-index Markdown files (MEMORY.md + last 3 days of dailies)
+        try {
+          const indexed = scanMemoryFiles(factsDb, 3);
+          if (indexed > 0) {
+            api.logger.info(
+              `total-reclaw: startup scan indexed ${indexed} new facts from Markdown files`,
+            );
+          }
+        } catch (err) {
+          api.logger.warn(`total-reclaw: startup scan failed: ${err}`);
         }
 
         pruneTimer = setInterval(() => {
@@ -1960,18 +1968,18 @@ const memoryHybridPlugin = {
             const softPruned = factsDb.decayConfidence();
             if (hardPruned > 0 || softPruned > 0) {
               api.logger.info(
-                `memory-hybrid: periodic prune — ${hardPruned} expired, ${softPruned} decayed`,
+                `total-reclaw: periodic prune — ${hardPruned} expired, ${softPruned} decayed`,
               );
             }
           } catch (err) {
-            api.logger.warn(`memory-hybrid: periodic prune failed: ${err}`);
+            api.logger.warn(`total-reclaw: periodic prune failed: ${err}`);
           }
         }, 60 * 60_000);
       },
       stop: () => {
         if (pruneTimer) clearInterval(pruneTimer);
         factsDb.close();
-        api.logger.info('memory-hybrid: stopped');
+        api.logger.info('total-reclaw: stopped');
       },
     });
   },
