@@ -27,7 +27,7 @@ import {
   type DecayClass,
   TTL_DEFAULTS,
   type HybridMemoryConfig,
-  hybridConfigSchema,
+  pluginConfigSchema,
   vectorDimsForModel,
 } from './config.js';
 
@@ -1375,10 +1375,10 @@ const memoryHybridPlugin = {
   description:
     'Two-tier memory: SQLite+FTS5 for structured facts, LanceDB for semantic search',
   kind: 'memory' as const,
-  configSchema: hybridConfigSchema,
+  configSchema: pluginConfigSchema,
 
   register(api: ClawdbotPluginApi) {
-    const cfg = hybridConfigSchema.parse(api.pluginConfig);
+    const cfg = pluginConfigSchema.parse(api.pluginConfig);
     const resolvedLancePath = api.resolvePath(cfg.lanceDbPath);
     const resolvedSqlitePath = api.resolvePath(cfg.sqlitePath);
     const vectorDim = vectorDimsForModel(cfg.embedding.model);
@@ -1837,8 +1837,8 @@ const memoryHybridPlugin = {
     api.registerCli(
       ({ program }) => {
         const mem = program
-          .command('hybrid-mem')
-          .description('Hybrid memory plugin commands');
+          .command('total-reclaw')
+          .description('Total Reclaw memory plugin commands');
 
         mem
           .command('stats')
@@ -2003,14 +2003,14 @@ const memoryHybridPlugin = {
       },
       {
         commands: [
-          'hybrid-mem',
-          'hybrid-mem stats',
-          'hybrid-mem prune',
-          'hybrid-mem checkpoint',
-          'hybrid-mem backfill-decay',
-          'hybrid-mem extract-daily',
-          'hybrid-mem search',
-          'hybrid-mem lookup',
+          'total-reclaw',
+          'total-reclaw stats',
+          'total-reclaw prune',
+          'total-reclaw checkpoint',
+          'total-reclaw backfill-decay',
+          'total-reclaw extract-daily',
+          'total-reclaw search',
+          'total-reclaw lookup',
         ],
       },
     );

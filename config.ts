@@ -63,7 +63,7 @@ function resolveEnvVars(value: string): string {
   });
 }
 
-export const hybridConfigSchema = {
+export const pluginConfigSchema = {
   parse(value: unknown): HybridMemoryConfig {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new Error('total-reclaw config required');
