@@ -3,6 +3,11 @@
   "version": "2026.1.24",
   "type": "module",
   "description": "Hybrid memory plugin: SQLite+FTS5 for structured facts, LanceDB for semantic search",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "vitest run benchmark"
+  },
   "dependencies": {
     "@lancedb/lancedb": "^0.23.0",
     "@sinclair/typebox": "0.34.47",
@@ -10,11 +15,16 @@
     "openai": "^6.16.0"
   },
   "devDependencies": {
+    "@huggingface/transformers": "^3.8.1",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
-    "typescript": "^5.7.0"
+    "sharp": "^0.34.5",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
   },
   "openclaw": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   }
 }

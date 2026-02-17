@@ -82,11 +82,12 @@ class FactsDB {
         key TEXT,
         value TEXT,
         source TEXT NOT NULL DEFAULT 'conversation',
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        search_tags TEXT DEFAULT ''
       )
     `);
 
-    // Create FTS5 virtual table for full-text search
+    // Create FTS5 virtual table for full-text search (porter stemming for reformulation)
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
         text,
@@ -94,29 +95,30 @@ class FactsDB {
         entity,
         key,
         value,
+        search_tags,
         content=facts,
         content_rowid=rowid,
-        tokenize='unicode61 remove_diacritics 2'
+        tokenize='porter unicode61 remove_diacritics 2'
       )
     `);
 
     // Triggers to keep FTS in sync
     this.db.exec(`
       CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
-        INSERT INTO facts_fts(rowid, text, category, entity, key, value)
-        VALUES (new.rowid, new.text, new.category, new.entity, new.key, new.value);
+        INSERT INTO facts_fts(rowid, text, category, entity, key, value, search_tags)
+        VALUES (new.rowid, new.text, new.category, new.entity, new.key, new.value, new.search_tags);
       END;
 
       CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
-        INSERT INTO facts_fts(facts_fts, rowid, text, category, entity, key, value)
-        VALUES ('delete', old.rowid, old.text, old.category, old.entity, old.key, old.value);
+        INSERT INTO facts_fts(facts_fts, rowid, text, category, entity, key, value, search_tags)
+        VALUES ('delete', old.rowid, old.text, old.category, old.entity, old.key, old.value, old.search_tags);
       END;
 
       CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
-        INSERT INTO facts_fts(facts_fts, rowid, text, category, entity, key, value)
-        VALUES ('delete', old.rowid, old.text, old.category, old.entity, old.key, old.value);
-        INSERT INTO facts_fts(rowid, text, category, entity, key, value)
-        VALUES (new.rowid, new.text, new.category, new.entity, new.key, new.value);
+        INSERT INTO facts_fts(facts_fts, rowid, text, category, entity, key, value, search_tags)
+        VALUES ('delete', old.rowid, old.text, old.category, old.entity, old.key, old.value, old.search_tags);
+        INSERT INTO facts_fts(rowid, text, category, entity, key, value, search_tags)
+        VALUES (new.rowid, new.text, new.category, new.entity, new.key, new.value, new.search_tags);
       END
     `);
 
@@ -188,9 +190,17 @@ class FactsDB {
     const row = this.db
       .prepare(`SELECT value FROM _meta WHERE key = 'fts_version'`)
       .get() as { value: string } | undefined;
-    if (row?.value === '2') return;
+    if (row?.value === '3') return;
 
-    // Drop old FTS table and triggers, then recreate with new tokenizer
+    // Add search_tags column if missing
+    const cols = this.db.prepare(`PRAGMA table_info(facts)`).all() as Array<{
+      name: string;
+    }>;
+    if (!cols.some(c => c.name === 'search_tags')) {
+      this.db.exec(`ALTER TABLE facts ADD COLUMN search_tags TEXT DEFAULT ''`);
+    }
+
+    // Drop old FTS table and triggers, recreate with porter stemming + search_tags
     this.db.exec(`
       DROP TRIGGER IF EXISTS facts_ai;
       DROP TRIGGER IF EXISTS facts_ad;
@@ -198,32 +208,32 @@ class FactsDB {
       DROP TABLE IF EXISTS facts_fts;
 
       CREATE VIRTUAL TABLE facts_fts USING fts5(
-        text, category, entity, key, value,
+        text, category, entity, key, value, search_tags,
         content=facts,
         content_rowid=rowid,
-        tokenize='unicode61 remove_diacritics 2'
+        tokenize='porter unicode61 remove_diacritics 2'
       );
 
       CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN
-        INSERT INTO facts_fts(rowid, text, category, entity, key, value)
-        VALUES (new.rowid, new.text, new.category, new.entity, new.key, new.value);
+        INSERT INTO facts_fts(rowid, text, category, entity, key, value, search_tags)
+        VALUES (new.rowid, new.text, new.category, new.entity, new.key, new.value, new.search_tags);
       END;
 
       CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN
-        INSERT INTO facts_fts(facts_fts, rowid, text, category, entity, key, value)
-        VALUES ('delete', old.rowid, old.text, old.category, old.entity, old.key, old.value);
+        INSERT INTO facts_fts(facts_fts, rowid, text, category, entity, key, value, search_tags)
+        VALUES ('delete', old.rowid, old.text, old.category, old.entity, old.key, old.value, old.search_tags);
       END;
 
       CREATE TRIGGER facts_au AFTER UPDATE ON facts BEGIN
-        INSERT INTO facts_fts(facts_fts, rowid, text, category, entity, key, value)
-        VALUES ('delete', old.rowid, old.text, old.category, old.entity, old.key, old.value);
-        INSERT INTO facts_fts(rowid, text, category, entity, key, value)
-        VALUES (new.rowid, new.text, new.category, new.entity, new.key, new.value);
+        INSERT INTO facts_fts(facts_fts, rowid, text, category, entity, key, value, search_tags)
+        VALUES ('delete', old.rowid, old.text, old.category, old.entity, old.key, old.value, old.search_tags);
+        INSERT INTO facts_fts(rowid, text, category, entity, key, value, search_tags)
+        VALUES (new.rowid, new.text, new.category, new.entity, new.key, new.value, new.search_tags);
       END;
 
       INSERT INTO facts_fts(facts_fts) VALUES('rebuild');
 
-      INSERT OR REPLACE INTO _meta (key, value) VALUES ('fts_version', '2');
+      INSERT OR REPLACE INTO _meta (key, value) VALUES ('fts_version', '3');
     `);
   }
 
@@ -261,6 +271,7 @@ class FactsDB {
       decayClass?: DecayClass;
       expiresAt?: number | null;
       confidence?: number;
+      searchTags?: string;
     },
   ): MemoryEntry {
     const nowSec = Math.floor(Date.now() / 1000);
@@ -273,6 +284,7 @@ class FactsDB {
         ? entry.expiresAt
         : calculateExpiry(decayClass, nowSec);
     const confidence = entry.confidence ?? 1.0;
+    const searchTags = entry.searchTags || generateSearchTags(entry.text, entry.entity, entry.key, entry.value);
 
     // UPSERT: if entity+key both set, update existing row
     if (entry.entity && entry.key) {
@@ -284,7 +296,7 @@ class FactsDB {
         this.db
           .prepare(
             `UPDATE facts SET text=?, value=?, importance=?, category=?, source=?,
-              created_at=?, decay_class=?, expires_at=?, last_confirmed_at=?, confidence=?
+              created_at=?, decay_class=?, expires_at=?, last_confirmed_at=?, confidence=?, search_tags=?
              WHERE id=?`,
           )
           .run(
@@ -298,6 +310,7 @@ class FactsDB {
             expiresAt,
             nowSec,
             confidence,
+            searchTags,
             existing.id,
           );
 
@@ -317,8 +330,8 @@ class FactsDB {
 
     this.db
       .prepare(
-        `INSERT INTO facts (id, text, category, importance, entity, key, value, source, created_at, decay_class, expires_at, last_confirmed_at, confidence)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO facts (id, text, category, importance, entity, key, value, source, created_at, decay_class, expires_at, last_confirmed_at, confidence, search_tags)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -334,6 +347,7 @@ class FactsDB {
         expiresAt,
         nowSec,
         confidence,
+        searchTags,
       );
 
     return {
@@ -384,11 +398,16 @@ class FactsDB {
   ): SearchResult[] {
     const { includeExpired = false } = options;
 
-    const safeQuery = query
+    const words = query
       .replace(/['"]/g, '')
       .split(/\s+/)
-      .filter(w => w.length > 1 && !STOP_WORDS.has(w.toLowerCase()))
-      .map(w => `"${w}"`)
+      .map(w => w.replace(/[^a-zA-Z0-9\u00C0-\u024F_-]/g, '')) // strip FTS5 special chars
+      .filter(w => w.length > 1 && !STOP_WORDS.has(w.toLowerCase()));
+
+    // Use prefix matching (word*) for words ≥ 3 chars to catch inflections,
+    // plus exact match ("word") as fallback for short words
+    const safeQuery = words
+      .map(w => w.length >= 3 ? `${w}*` : `"${w}"`)
       .join(' OR ');
 
     if (!safeQuery) return [];
@@ -948,6 +967,78 @@ function mergeResults(
 
   merged.sort((a, b) => b.score - a.score);
   return merged.slice(0, limit);
+}
+
+// ============================================================================
+// Search Tag Generation (synonyms & aliases for reformulation)
+// ============================================================================
+
+/** Static synonym map — common reformulations that FTS stemming alone can't handle. */
+const SYNONYM_MAP: Record<string, string[]> = {
+  // Databases
+  postgresql: ['database', 'db', 'sql', 'postgres', 'rdbms'],
+  mysql: ['database', 'db', 'sql', 'rdbms'],
+  sqlite: ['database', 'db', 'sql', 'rdbms'],
+  mongodb: ['database', 'db', 'nosql', 'document store'],
+  redis: ['cache', 'caching', 'key-value', 'in-memory'],
+
+  // CI/CD
+  'github actions': ['ci', 'cd', 'cicd', 'continuous integration', 'continuous delivery', 'pipeline'],
+  'gitlab ci': ['ci', 'cd', 'cicd', 'continuous integration', 'pipeline'],
+  jenkins: ['ci', 'cd', 'cicd', 'continuous integration', 'pipeline'],
+
+  // Frontend
+  react: ['frontend', 'ui', 'spa', 'component', 'jsx'],
+  'next.js': ['frontend', 'ssr', 'react framework', 'fullstack'],
+  vue: ['frontend', 'ui', 'spa', 'component'],
+  tailwind: ['css', 'styling', 'design', 'css framework'],
+  bootstrap: ['css', 'styling', 'design', 'css framework'],
+
+  // Backend
+  fastapi: ['backend', 'api', 'python', 'rest'],
+  express: ['backend', 'api', 'node', 'rest'],
+
+  // Build tools
+  turborepo: ['monorepo', 'build', 'workspace'],
+  bun: ['runtime', 'package manager', 'bundler'],
+  node: ['runtime', 'javascript', 'backend'],
+
+  // Code style
+  tabs: ['indentation', 'formatting', 'code style', 'whitespace'],
+  spaces: ['indentation', 'formatting', 'code style', 'whitespace'],
+  'snake_case': ['naming', 'convention', 'code style', 'formatting'],
+  camelcase: ['naming', 'convention', 'code style', 'formatting'],
+
+  // Editor
+  vim: ['editor', 'keybindings', 'neovim'],
+  vscode: ['editor', 'ide'],
+  cursor: ['editor', 'ide', 'ai editor'],
+
+  // Misc
+  typescript: ['language', 'typed', 'javascript', 'js', 'ts'],
+  javascript: ['language', 'js', 'scripting'],
+  mit: ['license', 'open source', 'oss'],
+  docker: ['container', 'containerization', 'deployment'],
+};
+
+function generateSearchTags(
+  text: string,
+  entity: string | null,
+  key: string | null,
+  value: string | null,
+): string {
+  const tags = new Set<string>();
+  const combined = [text, entity, key, value].filter(Boolean).join(' ').toLowerCase();
+
+  for (const [term, synonyms] of Object.entries(SYNONYM_MAP)) {
+    if (combined.includes(term.toLowerCase())) {
+      for (const syn of synonyms) {
+        tags.add(syn);
+      }
+    }
+  }
+
+  return [...tags].join(' ');
 }
 
 // ============================================================================
@@ -2115,3 +2206,9 @@ const memoryHybridPlugin = {
 };
 
 export default memoryHybridPlugin;
+
+// Test-visible exports
+export { FactsDB, VectorDB, Embeddings };
+export { classifyDecay, calculateExpiry, mergeResults, generateSearchTags };
+export { extractStructuredFields, shouldCapture, detectCategory };
+export type { MemoryEntry, SearchResult };
