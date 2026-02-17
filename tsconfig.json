@@ -12,5 +12,5 @@
       "openclaw/plugin-sdk": ["./types/openclaw/plugin-sdk"]
     }
   },
-  "include": ["*.ts", "types/**/*.d.ts", "tests/**/*.ts"]
+  "include": ["*.ts", "src/**/*.ts", "types/**/*.d.ts", "tests/**/*.ts"]
 }

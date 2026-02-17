@@ -226,9 +226,20 @@ npm run test:watch # Watch mode
 ### Project structure
 
 ```
-index.ts                 # Plugin entry point (tools, hooks, lifecycle, all logic)
+index.ts                 # Entry point — re-exports plugin + public API
 config.ts                # Configuration schema, decay classes, TTL defaults
 openclaw.plugin.json     # OpenClaw plugin manifest
+src/
+  plugin.ts              # Plugin registration (tools, CLI, hooks, service)
+  facts-db.ts            # FactsDB class (SQLite + FTS5)
+  vector-db.ts           # VectorDB class (LanceDB)
+  embeddings.ts          # OpenAI embeddings client
+  search.ts              # mergeResults, stop words
+  search-tags.ts         # Synonym map, generateSearchTags
+  decay.ts               # classifyDecay, calculateExpiry
+  extraction.ts          # extractStructuredFields, shouldCapture, detectCategory
+  markdown-scan.ts       # MEMORY.md + daily file extraction
+  types.ts               # MemoryEntry, SearchResult types
 tests/
   facts-db.test.ts       # 33 unit tests — FactsDB (SQLite + FTS5)
   classify.test.ts       # 39 unit tests — decay classification, capture, extraction
