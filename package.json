@@ -1,8 +1,11 @@
 {
-  "name": "@openclaw/total-reclaw",
-  "version": "2026.1.24",
+  "name": "@thefrenchoak/total-reclaw",
+  "version": "0.1.0",
   "type": "module",
-  "description": "Hybrid memory plugin: SQLite+FTS5 for structured facts, LanceDB for semantic search",
+  "description": "Hybrid memory plugin for OpenClaw. Persistent long-term memory using SQLite+FTS5 for structured facts and LanceDB for semantic vector search.",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
