@@ -61,10 +61,7 @@ Expired facts are pruned automatically on startup and hourly.
 ## Installation
 
 ```bash
-# In the OpenClaw extensions directory
-git clone https://github.com/your-org/total-reclaw.git
-cd total-reclaw
-npm install
+openclaw plugins install @thefrenchoak/total-reclaw
 ```
 
 ## Configuration
